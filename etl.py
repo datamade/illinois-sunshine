@@ -164,14 +164,22 @@ class SunshineTransformLoad(object):
         
 
     def makeRawTable(self):
-        inferer = TypeInferer(self.file_path)
-        inferer.infer()
-        
-        sql_table = sa.Table('raw_{0}'.format(self.table_name), 
-                             sa.MetaData())
 
-        for column_name, column_type in inferer.types.items():
-            sql_table.append_column(sa.Column(column_name, column_type()))
+        try:
+            sql_table = sa.Table('raw_{0}'.format(self.table_name), 
+                                 sa.MetaData(),
+                                 autoload=True,
+                                 autoload_with=self.connection.engine)
+        
+        except sa.exc.NoSuchTableError:
+            inferer = TypeInferer(self.file_path)
+            inferer.infer()
+            
+            sql_table = sa.Table('raw_{0}'.format(self.table_name), 
+                                 sa.MetaData())
+        
+            for column_name, column_type in inferer.types.items():
+                sql_table.append_column(sa.Column(column_name, column_type()))
         
         dialect = sa.dialects.postgresql.dialect()
         create_table = str(sa.schema.CreateTable(sql_table)\
@@ -193,6 +201,7 @@ class SunshineTransformLoad(object):
                 
                 for row in checker.checked_rows():
                     writer.writerow(row)
+            
 
     def bulkLoadRawData(self):
         import psycopg2
@@ -403,7 +412,7 @@ class SunshineOfficers(SunshineTransformLoad):
 
     def transform(self):
         for row in self.iterIncomingData():
-            
+            print(row)
             row_list = list(row.values())
 
             # Add empty committee_id
@@ -436,6 +445,54 @@ class SunshineOfficers(SunshineTransformLoad):
                    fields=fields)
 
         self.executeTransaction(update)
+    
+    def bulkLoadRawData(self):
+        import psycopg2
+        from sunshine.app_config import DB_USER, DB_PW, DB_HOST, \
+            DB_PORT, DB_NAME
+        
+        # drop_committee_id = ''' 
+        #     ALTER TABLE raw_{} DROP COLUMN committee_id
+        # '''.format(self.table_name)
+        # 
+        # self.executeTransaction(drop_committee_id)
+        
+
+        DB_CONN_STR = 'host={0} dbname={1} user={2} port={3}'\
+            .format(DB_HOST, DB_NAME, DB_USER, DB_PORT)
+
+        copy_st = ''' 
+            COPY raw_{0} FROM STDIN WITH CSV HEADER DELIMITER ','
+        '''.format(self.table_name)
+        
+        with open('%s_raw.csv' % self.file_path, 'r') as f:
+            next(f)
+            with psycopg2.connect(DB_CONN_STR) as conn:
+                with conn.cursor() as curs:
+                    try:
+                        curs.copy_expert(copy_st, f)
+                    except psycopg2.IntegrityError as e:
+                        logger.error(e, exc_info=True)
+                        print(e)
+                        conn.rollback()
+        
+        # add_committee_id = ''' 
+        #     ALTER TABLE raw_{} ADD COLUMN committee_id bigint
+        # '''.format(self.table_name)
+
+        # update_committee_id = ''' 
+        #     UPDATE raw_{0} SET
+        #       committee_id = s.committee_id
+        #     FROM (
+        #         SELECT * FROM officer_committees
+        #     ) AS s
+        #     WHERE raw_{0}."ID" = s.officer_id
+        # '''.format(self.table_name)
+        # 
+        # self.executeTransaction(add_committee_id)
+        # self.executeTransaction(update_committee_id)
+
+        os.remove('%s_raw.csv' % self.file_path)
 
 
 class SunshinePrevOfficers(SunshineOfficers):
@@ -1338,6 +1395,9 @@ if __name__ == "__main__":
     
     parser.add_argument('--chunk_size', help='Adjust the size of each insert when loading data',
                    type=int)
+    
+    parser.add_argument('--init', action='store_true',
+                   help='Initialize a new database')
 
     args = parser.parse_args()
 
@@ -1362,9 +1422,13 @@ if __name__ == "__main__":
 
         if args.chunk_size:
             chunk_size = args.chunk_size
+        
+        metadata = None
+        if args.init:
+            metadata = Base.metadata
 
         committees = SunshineCommittees(connection, 
-                                        Base.metadata, 
+                                        metadata=metadata, 
                                         chunk_size=chunk_size)
         committees.load()
         committees.addNameColumn()
@@ -1379,6 +1443,11 @@ if __name__ == "__main__":
         candidates.addDateColumn('NULL')
         
         del candidates
+        
+        off_cmte_xwalk = SunshineOfficerCommittees(connection, chunk_size=chunk_size)
+        off_cmte_xwalk.load(update_existing=True)
+        
+        del off_cmte_xwalk
 
         officers = SunshineOfficers(connection, chunk_size=chunk_size)
         officers.load(update_existing=True)
@@ -1401,11 +1470,6 @@ if __name__ == "__main__":
         can_cmte_xwalk.load()
         
         del can_cmte_xwalk
-
-        off_cmte_xwalk = SunshineOfficerCommittees(connection, chunk_size=chunk_size)
-        off_cmte_xwalk.load(update_existing=True)
-        
-        del off_cmte_xwalk
 
         filed_docs = SunshineFiledDocs(connection, chunk_size=chunk_size)
         filed_docs.load()
